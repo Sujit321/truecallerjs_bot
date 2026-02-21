@@ -1,9 +1,4 @@
-import type {
-  ApiMethods,
-  Opts,
-  Update,
-} from "https://deno.land/x/grammy_types@v3.22.1/mod.ts";
-
+import type { Update } from "https://deno.land/x/grammy_types@v3.22.1/mod.ts";
 import {
   login,
   type LoginResponse,
@@ -11,149 +6,161 @@ import {
   verifyOtp,
 } from "npm:truecallerjs@2.2.0";
 
-type BotParams<METHOD extends keyof ApiMethods<unknown>> =
-  & Opts<unknown>[METHOD]
-  & { method: METHOD };
+const BOT_TOKEN = Deno.env.get("TG_THIS_BOT_TOKEN");
 
-let tgChatId: number | undefined;
+if (!BOT_TOKEN) {
+  console.error("TG_THIS_BOT_TOKEN is missing!");
+}
 
-Deno.serve(async (request: Request) => {
+Deno.serve(async (req: Request) => {
   try {
-    if (request.method !== "POST") {
+    if (req.method !== "POST") {
       return new Response("OK");
     }
 
     let update: Update | undefined;
 
     try {
-      update = await request.json();
-    } catch {
-      return new Response("Invalid JSON");
+      update = await req.json();
+    } catch (e) {
+      console.error("Invalid JSON:", e);
+      return new Response("OK");
     }
 
     const message = update?.message;
-
     if (!message?.text) {
-      return new Response("No message");
+      return new Response("OK");
     }
 
-    tgChatId = message.chat.id;
+    const chatId = message.chat.id;
+    const text = message.text;
 
     const kv = await Deno.openKv();
-    const chatIdKey: [string, number] = ["users", tgChatId];
+    const key: [string, number] = ["users", chatId];
 
     type KvValue =
-      | { status: "awaiting_phone_no" }
-      | { status: "awaiting_otp"; phoneNumber: string; loginResponse: LoginResponse }
+      | { status: "awaiting_phone" }
+      | { status: "awaiting_otp"; phone: string; loginResponse: LoginResponse }
       | { status: "logged_in"; installationId: string; countryCode: string }
       | { status: "logged_out" };
 
-    const kvValue: KvValue =
-      (await kv.get<KvValue>(chatIdKey)).value ?? { status: "logged_out" };
+    const state: KvValue =
+      (await kv.get<KvValue>(key)).value ?? { status: "logged_out" };
 
     // START
-    if (message.text === "/start") {
-      return sendTgMessage(
-        "Use /login to login with your Truecaller account.",
-      );
+    if (text === "/start") {
+      await sendMessage(chatId, "Use /login to begin.");
+      return new Response("OK");
     }
 
-    // LOGIN
-    if (message.text === "/login") {
-      await kv.set(chatIdKey, { status: "awaiting_phone_no" });
-      return sendTgMessage("Enter phone number in +91 format:");
+    // LOGIN COMMAND
+    if (text === "/login") {
+      await kv.set(key, { status: "awaiting_phone" });
+      await sendMessage(chatId, "Enter phone number in +91 format:");
+      return new Response("OK");
     }
 
-    if (
-      kvValue.status === "awaiting_phone_no" &&
-      !message.text.startsWith("/")
-    ) {
-      if (!message.text.startsWith("+")) {
-        return sendTgMessage("Phone must start with +");
+    // PHONE INPUT
+    if (state.status === "awaiting_phone" && !text.startsWith("/")) {
+      if (!text.startsWith("+")) {
+        await sendMessage(chatId, "Phone must start with +");
+        return new Response("OK");
       }
 
-      let responseBody;
+      let response;
       try {
-        responseBody = await login(message.text);
+        response = await login(text);
       } catch (err) {
-        console.error(err);
-        return sendTgMessage("Login failed. Try later.");
+        console.error("Login error:", err);
+        await sendMessage(chatId, "Login failed. Try again later.");
+        return new Response("OK");
       }
 
-      await kv.set(chatIdKey, {
+      await kv.set(key, {
         status: "awaiting_otp",
-        phoneNumber: message.text,
-        loginResponse: responseBody,
+        phone: text,
+        loginResponse: response,
       });
 
-      return sendTgMessage("Enter OTP:");
+      await sendMessage(chatId, "Enter OTP:");
+      return new Response("OK");
     }
 
-    if (kvValue.status === "awaiting_otp" && !message.text.startsWith("/")) {
+    // OTP INPUT
+    if (state.status === "awaiting_otp" && !text.startsWith("/")) {
       let otpResponse;
 
       try {
         otpResponse = await verifyOtp(
-          kvValue.phoneNumber,
-          kvValue.loginResponse,
-          message.text,
+          state.phone,
+          state.loginResponse,
+          text,
         );
       } catch (err) {
-        console.error(err);
-        return sendTgMessage("OTP verification failed.");
+        console.error("OTP error:", err);
+        await sendMessage(chatId, "OTP verification failed.");
+        return new Response("OK");
       }
 
       if (!otpResponse.installationId) {
-        return sendTgMessage("Invalid OTP or login failed.");
+        await sendMessage(chatId, "Invalid OTP.");
+        return new Response("OK");
       }
 
-      await kv.set(chatIdKey, {
+      await kv.set(key, {
         status: "logged_in",
         installationId: otpResponse.installationId,
-        countryCode: kvValue.loginResponse.parsedCountryCode,
+        countryCode: state.loginResponse.parsedCountryCode,
       });
 
-      return sendTgMessage("Login successful.");
+      await sendMessage(chatId, "Login successful.");
+      return new Response("OK");
     }
 
-    if (message.text === "/logout") {
-      await kv.delete(chatIdKey);
-      return sendTgMessage("Logged out.");
-    }
-
-    if (kvValue.status !== "logged_in") {
-      return sendTgMessage("Please /login first.");
+    // LOGOUT
+    if (text === "/logout") {
+      await kv.delete(key);
+      await sendMessage(chatId, "Logged out.");
+      return new Response("OK");
     }
 
     // SEARCH
-    let searchResult;
-    try {
-      searchResult = await search({
-        number: message.text,
-        countryCode: kvValue.countryCode,
-        installationId: kvValue.installationId,
-      });
-    } catch (err) {
-      console.error(err);
-      return sendTgMessage("Search failed.");
+    if (state.status !== "logged_in") {
+      await sendMessage(chatId, "Please /login first.");
+      return new Response("OK");
     }
 
-    return sendTgMessage(searchResult.getName() || "No result found.");
-  } catch (error) {
-    console.error("Fatal Error:", error);
+    let result;
+    try {
+      result = await search({
+        number: text,
+        countryCode: state.countryCode,
+        installationId: state.installationId,
+      });
+    } catch (err) {
+      console.error("Search error:", err);
+      await sendMessage(chatId, "Search failed.");
+      return new Response("OK");
+    }
+
+    await sendMessage(chatId, result.getName() || "No result found.");
+    return new Response("OK");
+
+  } catch (err) {
+    console.error("Fatal error:", err);
     return new Response("OK"); // prevent Telegram 500
   }
 });
 
-function sendTgMessage(text: string) {
-  if (!tgChatId) return new Response("OK");
+async function sendMessage(chatId: number, text: string) {
+  if (!BOT_TOKEN) return;
 
-  return new Response(
-    JSON.stringify({
-      method: "sendMessage",
-      chat_id: tgChatId,
+  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
       text,
-    } satisfies BotParams<"sendMessage">),
-    { headers: { "Content-Type": "application/json" } },
-  );
+    }),
+  });
 }
